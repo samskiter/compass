@@ -1,0 +1,321 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include "graphing_library.h"
+#include "graphic_lcd.h"
+#include "exercise.h"
+#include "config.h"
+#include "sincoslookup.h"
+#include <math.h>
+
+/* Intended for ATmega644P */
+/* Clock rate is 8.0 MHz  (8MHz external oscillator , no divide by 8, to give CLKIO of 8MHz */
+
+// USART register setup - (from iomxx4.h):
+
+void applyPixelStretchCorrection(fixedPointCoord* p) {
+	p->x = p->x - centre.x;
+	p->x = centre.x + multfip(fip(1.15) * p->x);
+}
+
+fixedPointCoord rotateCoord(fixedPointCoord p, uint16_t theta) {
+//function that implicitly rotates about the centre of the LCD by an angle theta and returns an x,y, fixed point coordinate
+	p.x = p.x - centre.x;	//the difference between the distance to the origin and the x coord
+	p.y = centre.y - p.y;	//the difference between the distance to the origin and the y coord
+	fixedPoint costheta = coslup(theta);
+	fixedPoint sintheta = sinlup(theta);
+	fixedPointCoord pr;
+	pr.x = centre.x + (multfip(costheta*p.x) - multfip(sintheta*p.y)); //here we apply a correction factor for the pixel aspec ratio
+	pr.y = centre.y - (multfip(sintheta*p.x) + multfip(costheta*p.y)); 
+	return pr;
+}
+
+fixedPointLine rotateLine(fixedPointLine line, uint16_t theta) {
+	line.start = rotateCoord(line.start, theta);
+	applyPixelStretchCorrection(&(line.start));
+	line.end = rotateCoord(line.end, theta);
+	applyPixelStretchCorrection(&(line.end));
+	return line;
+}
+
+bool rotatePolygon(fixedPointPolygon* poly, uint16_t theta, fixedPointPolygon* fppoly) {
+//use a pointer to a pointer to a FPPolygon as we will create it and worry about valid Malloc here (and return bool) - therefore we need to be able to assign the FPPolygon back to whatever is calling
+	int vertex;
+	fixedPointCoord* fpvertices = calloc(poly->num_vertices, sizeof(fixedPointCoord));
+	if (NULL == fpvertices) {
+		return false; //error
+	}
+	fppoly->vertices = fpvertices; //we have now successfully assigned enough memory to do this
+	fppoly->num_vertices = poly->num_vertices;
+	for (vertex = 0; vertex < poly->num_vertices; vertex++) {
+		//index both ptrs to respective arrays
+		fppoly->vertices[vertex] = rotateCoord(poly->vertices[vertex], theta);
+		applyPixelStretchCorrection(&(fppoly->vertices[vertex]));
+	}
+	return true;
+}
+
+//this function initialises all the edges and orders them into the edge table sorted by increasing ymin and xmin
+bool initialise_global_edge_table(fixedPointPolygon* poly, fixedPointEdgeTable* edge_table) {
+	//malloc
+	fixedPointEdge* fpedges = calloc(poly->num_vertices, sizeof(fixedPointEdge)); //we must assign enough memory for every edge to be in the edge table, even though some may be discarded
+	if (NULL == fpedges) {
+		return false; //error, not enough space to make this
+	}
+	edge_table->edges = fpedges; //we have now successfully assigned enough memory to do this
+	edge_table->num_edges = 0; //we will increment this as we add each edge to the edge table
+	fixedPointCoord start_vertex;
+	fixedPointCoord end_vertex;
+	fixedPointLine last_line;
+	uint8_t vertex;
+	uint8_t curr_edge_type = 0; //this will allow us to track whether and edge is on the left or right of a filled section of the polygon
+								// however, the edge 'type' is arbitrary - '1' does not represent either left or right.
+	
+	//for every vertex, make an edge using it and the previous vertex
+	for (vertex = 0; vertex < poly->num_vertices; vertex++) {
+		start_vertex = poly->vertices[vertex];
+		if (vertex == 0) {
+			end_vertex = poly->vertices[poly->num_vertices - 1]; //no 'previous', so pull out the very last vertex
+		} else {
+			end_vertex = poly->vertices[vertex - 1];
+		}
+		
+		//make sure 'start' has the lowest y
+		if (start_vertex.y > end_vertex.y) {
+			fixedPointCoord tmp = start_vertex;
+			start_vertex = end_vertex;
+			end_vertex = tmp;
+		}
+		
+		fixedPoint dy = end_vertex.y - start_vertex.y; // change in y - used for the egde of the slope
+		if (roundfip(dy) == 0) { //if this edge is parallel to the scan line, we must give it special treatment
+			if (last_line.end.x != NULL) {
+				//this section moves the end of the previous line onto the end of this horizontal line
+				// but only for the purpose of allowing the 'last_line' to represent the extents of the most recent two vertices and so
+				// allow the 'edge_type' to be determined below (comparisons to start and end vertices are performed)
+				// the edge is not actually adjusted in terms of rendering.
+				if (start_vertex.x == last_line.end.x) {
+					//if the start vertex matches the top of the previous line
+					last_line.end.x = end_vertex.x;
+					last_line.end.y = end_vertex.y;
+				} else if (start_vertex.x == last_line.start.x) {
+					//if the start vertex happens to match the bottom of the previous line
+					last_line.start.x = end_vertex.x;
+					last_line.start.y = end_vertex.y;
+				} else if (end_vertex.x == last_line.end.x) {
+					//if the end vertex happens to match the top of the previous line
+					last_line.end.x = start_vertex.x;
+					last_line.end.y = start_vertex.y;
+				}  else if (end_vertex.x == last_line.start.x) {
+					//if the end vertex happens to match the bottom of the previous line
+					last_line.start.x = start_vertex.x;
+					last_line.start.y = start_vertex.y;
+				}
+			}
+			continue; // discard this egde - we dont need to draw horizontal lines (or close-to horizontal lines!), other edges will take care of this
+		}
+		
+		fixedPoint dx = end_vertex.x - start_vertex.x;
+		
+		fixedPointEdge new_edge; //make a new edge to be saved into the table and populate its values
+		new_edge.slope = fip(dx)/dy; //be careful of divides and multiplies
+		new_edge.ymin = start_vertex.y;
+		new_edge.x = start_vertex.x; //start vertex
+		new_edge.ymax = end_vertex.y;
+		new_edge.xlim = roundfip(end_vertex.x);
+		new_edge.status = INACTIVE;
+		
+		//if this and the last edge have the same start or end points, we must be changing direction (e.g. up to down)
+		if (((start_vertex.x == last_line.start.x) && (start_vertex.y == last_line.start.y))
+			|| ((end_vertex.x == last_line.end.x) && (end_vertex.y == last_line.end.y))) {
+			//changing direction
+			curr_edge_type = 1 - curr_edge_type; //invert
+		}
+		last_line.start.x = start_vertex.x;
+		last_line.start.y = start_vertex.y;
+		last_line.end.x = end_vertex.x;
+		last_line.end.y = end_vertex.y;
+		new_edge.type = curr_edge_type;
+		
+		//now find out where the new edge goes in the edge table (order by ymin then xmin, then slope)
+		uint8_t current_edge;
+		uint8_t new_position = edge_table->num_edges; //default position is to put it on the end
+		for (current_edge = 0; current_edge < edge_table->num_edges; current_edge++) {
+			if (edge_table->edges[current_edge].ymin > new_edge.ymin) { //if the current edge starts above the new edge
+				new_position = current_edge;
+				break;
+			} else if (edge_table->edges[current_edge].ymin == new_edge.ymin) {
+				if (edge_table->edges[current_edge].x > new_edge.x) { // if the current edge starts to the right of the new edge
+					//add the edge where current_edge is
+					new_position = current_edge;
+					break;
+				} else if (edge_table->edges[current_edge].x == new_edge.x) { //if these two edges start at the same point (and diverge)
+					//sort by slope
+					
+					if (edge_table->edges[current_edge].slope > new_edge.slope) { //if the current edge slopes rightward of the new edge
+						new_position = current_edge;
+						break;
+					}
+				}
+			}
+		}
+		
+		//insert the new edge in the new_position in the edge matrix (involves bumping the others up)
+		for (current_edge = edge_table->num_edges; current_edge > new_position; current_edge--) {
+			edge_table->edges[current_edge] = edge_table->edges[current_edge-1];
+		}
+		edge_table->edges[new_position] = new_edge;
+		edge_table->num_edges++;
+	}
+	return true;
+}
+
+void draw_polygon(fixedPointEdgeTable* global_edge_table) {
+	//initialise parity
+	uint8_t parity = 0; //0 represents 'not inside polygon'
+	uint8_t last_type = 2;
+	//initialise the scan-line - set to lowest y value
+	int8_t scan_line = roundfip(global_edge_table->edges[0].ymin);
+	
+	//initialise active edge table (size should be number of edges in the global edge table)
+	/*fixedPointEdgeTable active_edge_table;
+	fixedPointEdge* fpedges = calloc(global_edge_table->num_edges, sizeof(fixedPointEdge));
+	if (NULL == fpedges) {
+		return false; //error, not enough space to make this
+	}
+	active_edge_table.edges = fpedges; //we have now successfully assigned enough memory to do this
+	*/
+	uint8_t active_edges = 0;
+	//loop the global edge table and update the edges for this scan line
+	uint8_t current_edge;
+	fixedPointEdge start_edge;
+	uintCoord current;
+	
+	while(1) {
+		for (current_edge = 0; current_edge < global_edge_table->num_edges; current_edge++) {
+			if (global_edge_table->edges[current_edge].status == ACTIVE) {
+				//evaluate if this edge should be deactivated
+				if (global_edge_table->edges[current_edge].ymax < (fip(scan_line) - fip(0.5))) { //we subtract 0.5 because we want the scan line to be beyond the end of the edge before disabling it
+					//deactivate it
+					global_edge_table->edges[current_edge].status = COMPLETE;
+					active_edges--;
+				} else {
+					//increment the pixel's x value
+					global_edge_table->edges[current_edge].x += global_edge_table->edges[current_edge].slope;
+					//put a cap on x values - this fixes issues with very high gradients creating lines off the polygon
+					if (((global_edge_table->edges[current_edge].slope > 0) && (roundfip(global_edge_table->edges[current_edge].x) > global_edge_table->edges[current_edge].xlim))
+						|| ((global_edge_table->edges[current_edge].slope < 0) && (roundfip(global_edge_table->edges[current_edge].x) < global_edge_table->edges[current_edge].xlim))) {
+						global_edge_table->edges[current_edge].x = fip(global_edge_table->edges[current_edge].xlim);
+					}
+				}
+			} else if (global_edge_table->edges[current_edge].status == INACTIVE) {
+				//evaluate if this edge should be activated
+				//_delay_ms(10);
+				if (global_edge_table->edges[current_edge].ymin < (fip(scan_line) + fip(0.5))) { //we add 0.5 because if the scan line were at 0, we would want to pick up ymins from -0.5 to 0.5					
+					global_edge_table->edges[current_edge].status = ACTIVE;
+					active_edges++;
+					//we need to make sure this edge is in the right place
+					int8_t past_edge;
+					int8_t current_edge_tmp = current_edge;
+					for (past_edge = (current_edge-1); past_edge >= 0; past_edge--) { //iterate back down through the older (active/complete) edges and find any active ones with greater x
+						if (global_edge_table->edges[past_edge].status == ACTIVE) {
+							if ((global_edge_table->edges[current_edge_tmp].x < global_edge_table->edges[past_edge].x) 
+								&& (global_edge_table->edges[past_edge].ymax != global_edge_table->edges[current_edge_tmp].ymin)) {
+								//the above if statement stops a new edge that is continuing upward from an older edge from swapping with it while they are both active
+								//this is relevant as they are allowed to both be active simultaneously (as the +-0.5 has to account for inflection points)
+								fixedPointEdge tmp_edge = global_edge_table->edges[current_edge_tmp]; //this assignment copies the data across (there are no pointers in a fixedpoint edge)
+								
+								global_edge_table->edges[current_edge_tmp] = global_edge_table->edges[past_edge];
+								global_edge_table->edges[past_edge] = tmp_edge;
+								current_edge_tmp = past_edge;
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		if (active_edges == 0) break;
+		parity = 1;
+		last_type = 2; //2 is a special value meaning uninitialised
+		current.y = scan_line;
+		for (current_edge = 0; current_edge < global_edge_table->num_edges; current_edge++) {
+			if (global_edge_table->edges[current_edge].status == ACTIVE) {
+				if(last_type == 2) last_type = 1 - global_edge_table->edges[current_edge].type; //initialise last_type
+				if (global_edge_table->edges[current_edge].type != last_type) {
+					parity = 1 - parity;
+					if (parity == 0) {
+						start_edge = global_edge_table->edges[current_edge];
+					} else {
+						for (current.x = roundfip(start_edge.x); fip(current.x) <= (global_edge_table->edges[current_edge].x + fip(0.5)); current.x++) {
+							LCD_set_pixel(current);
+						}
+					}
+				}
+				last_type = global_edge_table->edges[current_edge].type;
+			}
+		}
+		scan_line++;
+	}
+}
+
+void draw_line(fixedPointCoord start, fixedPointCoord end) {
+	fixedPoint dx = end.x - start.x;
+	fixedPoint dy = end.y - start.y;
+	//pick the mode that will increment along the correct dimension
+	if (absint(dx) >= absint(dy)) {
+		//we are now incrementing along the x direction
+		line_algorithm(start, end, 0);
+	} else {
+		fixedPointCoord start_t;
+		fixedPointCoord end_t;
+		start_t.x = start.y;
+		start_t.y = start.x;
+		end_t.x = end.y;
+		end_t.y = end.x;
+		//we use the transpose indicator to flip the algorithm to increment along the y direction
+		line_algorithm(start_t, end_t, 1);
+	}
+}
+
+void draw_line_l(fixedPointLine line) {
+	draw_line(line.start, line.end);
+}
+
+//subpixel line drawing is pretty: http://www.antigrain.com/doc/introduction/introduction.agdoc.html (Bresenham's)
+void line_algorithm(fixedPointCoord start, fixedPointCoord end, int8_t transpose) {
+//transpose make x and y be flipped when written (for incrementing in the y direction
+	//initialise and draw the first pointcurrent
+	fixedPoint dx = end.x - start.x;
+	fixedPoint dy = end.y - start.y;
+	fixedPoint d = fip(dy)/dx; //be careful of divides and multiplies
+	uintCoord current; //records the current pixel we are writing to
+	if (end.x < start.x) {
+		fixedPointCoord tmp = start;
+		start = end;
+		end = tmp;
+		d=(-1)*d;
+	}
+	
+	current.x = roundfip(start.x);
+	fixedPoint yf = start.y + multfip(d * (fip(current.x) - start.x)); //because of multiplying, we have to take a layer of fipping off - multfip does this
+	current.y = roundfip(yf);
+	yf = yf - fip(current.y);
+	LCD_set_pixel_tr(current, transpose);
+	
+	//make sure the iteration goes the right way
+	int y_dir = 1;
+	if (end.y < start.y) {
+		y_dir = -1;
+		yf = -1 * yf; //we will be only be incrementing Yf as it it simply a reference to proportion through the pixel we are. If we are moving negatively through y, we should move yf to the other end of its range
+	}
+	while (fip(current.x) < (end.x - fip(0.5))) {
+		current.x += 1;
+		yf += absint(d);
+		if (yf > fip(0.5)) {
+			current.y += y_dir;
+			yf -= fip(1);
+		}
+		LCD_set_pixel_tr(current, transpose);
+	}
+}

@@ -1,0 +1,20 @@
+#define XCK1		PD4
+#define LCD_DC		PD5
+#define LCD_RESET	PD6
+#define LCD_COMMAND_MODE 0
+#define LCD_DATA_MODE    1
+
+#define PI 				3.14159265
+#define LCD_HEIGHT		48
+#define LCD_BYTE_HEIGHT	8
+#define LCD_ROWS		LCD_HEIGHT/LCD_BYTE_HEIGHT
+#define LCD_WIDTH		84
+
+#define MAX_POLY_VERTICES 4
+
+#define ARROW_HEIGHT		48
+#define ARROW_BYTE_HEIGHT	8
+#define ARROW_ROWS			ARROW_HEIGHT/ARROW_BYTE_HEIGHT
+#define ARROW_WIDTH			48
+
+#define F_CPU  8E6

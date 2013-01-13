@@ -1,0 +1,18 @@
+#ifndef LCD_H
+#define LCD_H
+
+#include "exercise.h"
+
+void LCD_init();
+void LCD_reset();
+void LCD_set_mode(uint8_t mode);
+void LCD_transmit( uint8_t data );
+void LCD_transmit_data( uint8_t data );
+void LCD_transmit_command( uint8_t data );
+void LCD_clear_buff();
+void LCD_clear();
+void LCD_update();
+void LCD_set_pixel(uintCoord p);
+void LCD_set_pixel_tr(uintCoord p, uint8_t transpose);
+
+#endif
